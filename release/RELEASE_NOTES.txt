@@ -1,0 +1,2 @@
+Uruchom Start-KinectWindowsWebCam.bat jako administrator przy pierwszym uruchomieniu.
+Skrypt sprawdzi Kinect SDK 1.8, doinstaluje UnityCapture i uruchomi aplikację.
