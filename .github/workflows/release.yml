@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish self-contained exe
+        run: dotnet publish KinectWindowsWebCam.csproj -c Release -r win-x64 -p:PublishSingleFile=true -p:SelfContained=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false -o publish
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-package -Force | Out-Null
+          Copy-Item publish/KinectWindowsWebCam.exe release-package/
+          Copy-Item release/Start-KinectWindowsWebCam.bat release-package/
+          Copy-Item release/RELEASE_NOTES.txt release-package/
+          Compress-Archive -Path release-package/* -DestinationPath KinectWindowsWebCam-win-x64.zip -Force
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            KinectWindowsWebCam-win-x64.zip
+            release-package/KinectWindowsWebCam.exe
+          generate_release_notes: true

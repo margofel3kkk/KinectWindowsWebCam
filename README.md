@@ -2,20 +2,26 @@
 
 Aplikacja WinForms dla Windows 10/11 zamienia Kinect Xbox 360 (v1) w kamerę wirtualną widoczną w Chrome, Discord, OBS i innych aplikacjach obsługujących DirectShow.
 
+## Gotowy release (.exe)
+
+- W zakładce Releases pobierz `KinectWindowsWebCam-win-x64.zip`.
+- Rozpakuj paczkę.
+- Przy pierwszym uruchomieniu odpal `Start-KinectWindowsWebCam.bat` jako administrator.
+- Skrypt:
+  - sprawdza obecność Kinect SDK 1.8,
+  - doinstalowuje UnityCapture (jeśli brak),
+  - uruchamia `KinectWindowsWebCam.exe`.
+
 ## Wymagania
 
 - Windows 10 lub 11
 - Kinect for Windows SDK 1.8
 - Kinect Xbox 360 (v1) z adapterem zasilająco-USB
-- UnityCapture
 
-## Instalacja
+## Automatyczne wydanie release
 
-1. Zainstaluj Kinect for Windows SDK 1.8: https://www.microsoft.com/en-us/download/details.aspx?id=40278
-2. Pobierz UnityCapture: https://github.com/schellingb/UnityCapture
-3. Uruchom `Install\Install.bat` z UnityCapture jako administrator.
-4. Sklonuj repozytorium i otwórz projekt w Visual Studio 2022.
-5. Zbuduj i uruchom aplikację.
+- Workflow `.github/workflows/release.yml` buduje self-contained single-file `KinectWindowsWebCam.exe` dla `win-x64`.
+- Push taga `v*` tworzy GitHub Release i dodaje pliki do pobrania.
 
 ## Działanie
 
