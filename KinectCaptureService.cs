@@ -1,83 +1,183 @@
-using Microsoft.Kinect;
+using System.Reflection;
 
 namespace KinectWindowsWebCam;
 
 public sealed class KinectCaptureService : IDisposable
 {
-    private KinectSensor? _sensor;
+    private readonly System.Threading.Timer _reconnectTimer;
+    private readonly object _sync = new();
+    private Assembly? _kinectAssembly;
+    private object? _sensorCollection;
+    private object? _sensor;
+    private EventInfo? _statusChangedEvent;
+    private EventInfo? _colorFrameReadyEvent;
+    private Delegate? _statusChangedHandler;
+    private Delegate? _colorFrameReadyHandler;
     private byte[]? _frameBuffer;
+
+    public KinectCaptureService()
+    {
+        _reconnectTimer = new System.Threading.Timer(_ => TryConnect(), null, Timeout.Infinite, Timeout.Infinite);
+    }
 
     public event EventHandler<KinectFrameEventArgs>? FrameReady;
     public event EventHandler<KinectStatusEventArgs>? SensorStateChanged;
-    public event EventHandler<KinectSensor?>? SensorChanged;
+    public event EventHandler<object?>? SensorChanged;
 
     public void Start()
     {
-        KinectSensor.KinectSensors.StatusChanged += OnKinectStatusChanged;
-        TryConnect();
-    }
-
-    private void OnKinectStatusChanged(object? sender, StatusChangedEventArgs e)
-    {
-        if (_sensor == e.Sensor && e.Status != KinectStatus.Connected)
+        if (!LoadKinectAssembly())
         {
-            DisconnectCurrentSensor();
-            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak"));
-            TryConnect();
+            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak SDK"));
             return;
         }
 
-        if (_sensor == null)
+        SubscribeStatusChanged();
+        TryConnect();
+        _reconnectTimer.Change(2000, 2000);
+    }
+
+    private bool LoadKinectAssembly()
+    {
+        try
         {
-            TryConnect();
+            _kinectAssembly = Assembly.Load("Microsoft.Kinect");
+            var sensorType = _kinectAssembly.GetType("Microsoft.Kinect.KinectSensor");
+            _sensorCollection = sensorType?.GetProperty("KinectSensors", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            return _sensorCollection != null;
         }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void SubscribeStatusChanged()
+    {
+        if (_sensorCollection == null)
+        {
+            return;
+        }
+
+        _statusChangedEvent = _sensorCollection.GetType().GetEvent("StatusChanged");
+        if (_statusChangedEvent == null)
+        {
+            return;
+        }
+
+        _statusChangedHandler = Delegate.CreateDelegate(_statusChangedEvent.EventHandlerType!, this, nameof(OnKinectStatusChanged));
+        _statusChangedEvent.AddEventHandler(_sensorCollection, _statusChangedHandler);
+    }
+
+    private void OnKinectStatusChanged(object? sender, EventArgs e)
+    {
+        dynamic statusArgs = e;
+        lock (_sync)
+        {
+            if (_sensor != null && ReferenceEquals(_sensor, statusArgs.Sensor) && statusArgs.Status.ToString() != "Connected")
+            {
+                DisconnectCurrentSensor();
+                SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak"));
+            }
+        }
+
+        TryConnect();
     }
 
     private void TryConnect()
     {
-        var sensor = KinectSensor.KinectSensors.FirstOrDefault(s => s.Status == KinectStatus.Connected);
-        if (sensor == null)
+        if (_sensorCollection == null)
         {
+            return;
+        }
+
+        lock (_sync)
+        {
+            if (_sensor != null)
+            {
+                return;
+            }
+
+            foreach (var candidate in (System.Collections.IEnumerable)_sensorCollection)
+            {
+                dynamic sensor = candidate;
+                if (sensor.Status.ToString() != "Connected")
+                {
+                    continue;
+                }
+
+                if (AttachSensor(candidate))
+                {
+                    SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("wykryty"));
+                    SensorChanged?.Invoke(this, _sensor);
+                    return;
+                }
+            }
+
             SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak"));
             SensorChanged?.Invoke(this, null);
-            return;
+        }
+    }
+
+    private bool AttachSensor(object sensor)
+    {
+        if (_kinectAssembly == null)
+        {
+            return false;
         }
 
         try
         {
+            dynamic sensorDynamic = sensor;
+            var formatType = _kinectAssembly.GetType("Microsoft.Kinect.ColorImageFormat");
+            var format = Enum.Parse(formatType!, "RgbResolution640x480Fps30");
+            sensorDynamic.ColorStream.Enable(format);
+
+            _colorFrameReadyEvent = sensor.GetType().GetEvent("ColorFrameReady");
+            _colorFrameReadyHandler = Delegate.CreateDelegate(_colorFrameReadyEvent!.EventHandlerType!, this, nameof(OnColorFrameReady));
+            _colorFrameReadyEvent.AddEventHandler(sensor, _colorFrameReadyHandler);
+
+            sensorDynamic.Start();
             _sensor = sensor;
-            _sensor.ColorStream.Enable(ColorImageFormat.RgbResolution640x480Fps30);
-            _sensor.ColorFrameReady += OnColorFrameReady;
-            _sensor.Start();
-            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("wykryty"));
-            SensorChanged?.Invoke(this, _sensor);
+            return true;
         }
         catch
         {
-            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("błąd"));
             DisconnectCurrentSensor();
+            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("błąd"));
+            return false;
         }
     }
 
-    private void OnColorFrameReady(object? sender, ColorImageFrameReadyEventArgs e)
+    private void OnColorFrameReady(object? sender, EventArgs e)
     {
-        using var frame = e.OpenColorImageFrame();
+        dynamic args = e;
+        dynamic frame = args.OpenColorImageFrame();
         if (frame == null)
         {
             return;
         }
 
-        var length = frame.PixelDataLength;
-        _frameBuffer ??= new byte[length];
-        if (_frameBuffer.Length != length)
+        try
         {
-            _frameBuffer = new byte[length];
-        }
+            int length = frame.PixelDataLength;
+            _frameBuffer ??= new byte[length];
+            if (_frameBuffer.Length != length)
+            {
+                _frameBuffer = new byte[length];
+            }
 
-        frame.CopyPixelDataTo(_frameBuffer);
-        var frameCopy = new byte[length];
-        Buffer.BlockCopy(_frameBuffer, 0, frameCopy, 0, length);
-        FrameReady?.Invoke(this, new KinectFrameEventArgs(frameCopy, frame.Width, frame.Height));
+            frame.CopyPixelDataTo(_frameBuffer);
+            var frameCopy = new byte[length];
+            Buffer.BlockCopy(_frameBuffer, 0, frameCopy, 0, length);
+            int width = frame.Width;
+            int height = frame.Height;
+            FrameReady?.Invoke(this, new KinectFrameEventArgs(frameCopy, width, height));
+        }
+        finally
+        {
+            frame.Dispose();
+        }
     }
 
     private void DisconnectCurrentSensor()
@@ -89,21 +189,36 @@ public sealed class KinectCaptureService : IDisposable
 
         try
         {
-            _sensor.ColorFrameReady -= OnColorFrameReady;
-            _sensor.Stop();
+            if (_colorFrameReadyEvent != null && _colorFrameReadyHandler != null)
+            {
+                _colorFrameReadyEvent.RemoveEventHandler(_sensor, _colorFrameReadyHandler);
+            }
+
+            dynamic sensorDynamic = _sensor;
+            sensorDynamic.Stop();
         }
         catch
         {
         }
 
         _sensor = null;
+        _colorFrameReadyEvent = null;
+        _colorFrameReadyHandler = null;
         SensorChanged?.Invoke(this, null);
     }
 
     public void Dispose()
     {
-        KinectSensor.KinectSensors.StatusChanged -= OnKinectStatusChanged;
-        DisconnectCurrentSensor();
+        _reconnectTimer.Dispose();
+        if (_statusChangedEvent != null && _statusChangedHandler != null && _sensorCollection != null)
+        {
+            _statusChangedEvent.RemoveEventHandler(_sensorCollection, _statusChangedHandler);
+        }
+
+        lock (_sync)
+        {
+            DisconnectCurrentSensor();
+        }
     }
 }
 

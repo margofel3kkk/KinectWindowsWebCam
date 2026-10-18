@@ -77,7 +77,7 @@ public sealed class VirtualCameraWriter : IDisposable
 
         try
         {
-            _mutex = Mutex.OpenExisting(_mutexName, MutexRights.Synchronize);
+            _mutex = Mutex.OpenExisting(_mutexName);
             _wantFrameEvent = EventWaitHandle.OpenExisting(_wantFrameEventName);
             _sentFrameEvent = EventWaitHandle.OpenExisting(_sentFrameEventName);
             _mappedFile = MemoryMappedFile.OpenExisting(_sharedDataName, MemoryMappedFileRights.ReadWrite);

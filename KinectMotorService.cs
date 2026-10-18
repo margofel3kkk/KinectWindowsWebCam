@@ -1,12 +1,10 @@
-using Microsoft.Kinect;
-
 namespace KinectWindowsWebCam;
 
 public sealed class KinectMotorService : IDisposable
 {
     private readonly object _sync = new();
     private readonly System.Threading.Timer _timer;
-    private KinectSensor? _sensor;
+    private object? _sensor;
     private int _targetTilt;
 
     public KinectMotorService()
@@ -14,7 +12,7 @@ public sealed class KinectMotorService : IDisposable
         _timer = new System.Threading.Timer(_ => ApplyTilt(), null, Timeout.Infinite, Timeout.Infinite);
     }
 
-    public void SetSensor(KinectSensor? sensor)
+    public void SetSensor(object? sensor)
     {
         lock (_sync)
         {
@@ -34,7 +32,7 @@ public sealed class KinectMotorService : IDisposable
 
     private void ApplyTilt()
     {
-        KinectSensor? sensor;
+        object? sensor;
         int target;
 
         lock (_sync)
@@ -43,14 +41,20 @@ public sealed class KinectMotorService : IDisposable
             target = _targetTilt;
         }
 
-        if (sensor == null || sensor.Status != KinectStatus.Connected)
+        if (sensor == null)
         {
             return;
         }
 
         try
         {
-            sensor.ElevationAngle = target;
+            dynamic sensorDynamic = sensor;
+            if (sensorDynamic.Status.ToString() != "Connected")
+            {
+                return;
+            }
+
+            sensorDynamic.ElevationAngle = target;
         }
         catch
         {
