@@ -1,187 +1,276 @@
-using System.Reflection;
+using System;
+using System.Threading;
 
 namespace KinectWindowsWebCam;
 
-public sealed class KinectCaptureService : IDisposable
+internal enum KinectState
 {
-    private readonly System.Threading.Timer _reconnectTimer;
-    private readonly object _sync = new();
-    private Assembly? _kinectAssembly;
-    private object? _sensorCollection;
-    private object? _sensor;
-    private EventInfo? _statusChangedEvent;
-    private EventInfo? _colorFrameReadyEvent;
-    private Delegate? _statusChangedHandler;
-    private Delegate? _colorFrameReadyHandler;
-    private byte[]? _frameBuffer;
+    Starting,
+    DriverMissing,
+    NotConnected,
+    Error,
+    Running
+}
 
-    public KinectCaptureService()
+internal sealed class KinectStatus
+{
+    public KinectStatus(KinectState state, string text)
     {
-        _reconnectTimer = new System.Threading.Timer(_ => TryConnect(), null, Timeout.Infinite, Timeout.Infinite);
+        State = state;
+        Text = text;
     }
 
-    public event EventHandler<KinectFrameEventArgs>? FrameReady;
-    public event EventHandler<KinectStatusEventArgs>? SensorStateChanged;
-    public event EventHandler<object?>? SensorChanged;
+    public KinectState State { get; }
+    public string Text { get; }
+}
+
+internal delegate void KinectFrameHandler(IntPtr bgrxPixels, int pitch, int width, int height);
+
+internal sealed class KinectCaptureService : IDisposable
+{
+    private const int RetryDelayMs = 2000;
+    private const uint FrameWaitMs = 100;
+    private const int NoFrameTimeoutMs = 3000;
+    private const int NoTiltReading = int.MinValue;
+    private const int SuccessFalse = 1;
+
+    private readonly TiltScheduler _tilt;
+    private readonly KinectFrameHandler _frameHandler;
+    private readonly NuiFrameTextureAccessor _texture = new();
+    private readonly ManualResetEvent _stop = new(false);
+    private readonly Thread _thread;
+    private volatile KinectStatus _status = new(KinectState.Starting, "uruchamianie…");
+    private int _tiltReading = NoTiltReading;
+    private NuiSensor? _sensor;
+    private IntPtr _colorStream;
+
+    public KinectCaptureService(TiltScheduler tilt, KinectFrameHandler frameHandler)
+    {
+        _tilt = tilt;
+        _frameHandler = frameHandler;
+        _thread = new Thread(Run)
+        {
+            IsBackground = true,
+            Name = "Kinect capture"
+        };
+    }
+
+    public KinectStatus Status => _status;
 
     public void Start()
     {
-        if (!LoadKinectAssembly())
-        {
-            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak SDK"));
-            return;
-        }
-
-        SubscribeStatusChanged();
-        TryConnect();
-        _reconnectTimer.Change(2000, 2000);
+        _thread.Start();
     }
 
-    private bool LoadKinectAssembly()
+    public bool TryTakeTiltReading(out int angle)
     {
+        angle = Interlocked.Exchange(ref _tiltReading, NoTiltReading);
+        return angle != NoTiltReading;
+    }
+
+    public bool Stop(TimeSpan timeout)
+    {
+        _stop.Set();
+        return !_thread.IsAlive || _thread.Join(timeout);
+    }
+
+    public void Dispose()
+    {
+        if (Stop(TimeSpan.FromSeconds(3)))
+        {
+            _stop.Dispose();
+        }
+    }
+
+    private void Run()
+    {
+        var comResult = NativeMethods.CoInitializeEx(IntPtr.Zero, NativeMethods.CoInitMultithreaded);
         try
         {
-            _kinectAssembly = Assembly.Load("Microsoft.Kinect");
-            var sensorType = _kinectAssembly.GetType("Microsoft.Kinect.KinectSensor");
-            _sensorCollection = sensorType?.GetProperty("KinectSensors", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            return _sensorCollection != null;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private void SubscribeStatusChanged()
-    {
-        if (_sensorCollection == null)
-        {
-            return;
-        }
-
-        _statusChangedEvent = _sensorCollection.GetType().GetEvent("StatusChanged");
-        if (_statusChangedEvent == null)
-        {
-            return;
-        }
-
-        _statusChangedHandler = Delegate.CreateDelegate(_statusChangedEvent.EventHandlerType!, this, nameof(OnKinectStatusChanged));
-        _statusChangedEvent.AddEventHandler(_sensorCollection, _statusChangedHandler);
-    }
-
-    private void OnKinectStatusChanged(object? sender, EventArgs e)
-    {
-        dynamic statusArgs = e;
-        lock (_sync)
-        {
-            if (_sensor != null && ReferenceEquals(_sensor, statusArgs.Sensor) && statusArgs.Status.ToString() != "Connected")
+            while (!_stop.WaitOne(0))
             {
-                DisconnectCurrentSensor();
-                SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak"));
-            }
-        }
-
-        TryConnect();
-    }
-
-    private void TryConnect()
-    {
-        if (_sensorCollection == null)
-        {
-            return;
-        }
-
-        lock (_sync)
-        {
-            if (_sensor != null)
-            {
-                return;
-            }
-
-            foreach (var candidate in (System.Collections.IEnumerable)_sensorCollection)
-            {
-                dynamic sensor = candidate;
-                if (sensor.Status.ToString() != "Connected")
+                try
                 {
-                    continue;
+                    if (Connect())
+                    {
+                        Pump();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    SetStatus(KinectState.Error, "błąd: " + exception.Message);
+                }
+                finally
+                {
+                    Disconnect();
                 }
 
-                if (AttachSensor(candidate))
+                if (_stop.WaitOne(RetryDelayMs))
                 {
-                    SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("wykryty"));
-                    SensorChanged?.Invoke(this, _sensor);
-                    return;
+                    break;
                 }
             }
-
-            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("brak"));
-            SensorChanged?.Invoke(this, null);
-        }
-    }
-
-    private bool AttachSensor(object sensor)
-    {
-        if (_kinectAssembly == null)
-        {
-            return false;
-        }
-
-        try
-        {
-            dynamic sensorDynamic = sensor;
-            var formatType = _kinectAssembly.GetType("Microsoft.Kinect.ColorImageFormat");
-            var format = Enum.Parse(formatType!, "RgbResolution640x480Fps30");
-            sensorDynamic.ColorStream.Enable(format);
-
-            _colorFrameReadyEvent = sensor.GetType().GetEvent("ColorFrameReady");
-            _colorFrameReadyHandler = Delegate.CreateDelegate(_colorFrameReadyEvent!.EventHandlerType!, this, nameof(OnColorFrameReady));
-            _colorFrameReadyEvent.AddEventHandler(sensor, _colorFrameReadyHandler);
-
-            sensorDynamic.Start();
-            _sensor = sensor;
-            return true;
-        }
-        catch
-        {
-            DisconnectCurrentSensor();
-            SensorStateChanged?.Invoke(this, new KinectStatusEventArgs("błąd"));
-            return false;
-        }
-    }
-
-    private void OnColorFrameReady(object? sender, EventArgs e)
-    {
-        dynamic args = e;
-        dynamic frame = args.OpenColorImageFrame();
-        if (frame == null)
-        {
-            return;
-        }
-
-        try
-        {
-            int length = frame.PixelDataLength;
-            _frameBuffer ??= new byte[length];
-            if (_frameBuffer.Length != length)
-            {
-                _frameBuffer = new byte[length];
-            }
-
-            frame.CopyPixelDataTo(_frameBuffer);
-            var frameCopy = new byte[length];
-            Buffer.BlockCopy(_frameBuffer, 0, frameCopy, 0, length);
-            int width = frame.Width;
-            int height = frame.Height;
-            FrameReady?.Invoke(this, new KinectFrameEventArgs(frameCopy, width, height));
         }
         finally
         {
-            frame.Dispose();
+            if (comResult >= 0)
+            {
+                NativeMethods.CoUninitialize();
+            }
         }
     }
 
-    private void DisconnectCurrentSensor()
+    private bool Connect()
     {
+        int count;
+        int hr;
+        try
+        {
+            hr = Kinect10.NuiGetSensorCount(out count);
+        }
+        catch (DllNotFoundException)
+        {
+            SetStatus(KinectState.DriverMissing, "brak sterownika – zainstaluj Kinect for Windows SDK 1.8");
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            SetStatus(KinectState.DriverMissing, "niezgodny Kinect10.dll – zainstaluj Kinect for Windows SDK 1.8");
+            return false;
+        }
+        catch (BadImageFormatException)
+        {
+            SetStatus(KinectState.DriverMissing, "uszkodzony Kinect10.dll – przeinstaluj Kinect for Windows SDK 1.8");
+            return false;
+        }
+
+        if (hr < 0)
+        {
+            SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
+            return false;
+        }
+
+        if (count < 1)
+        {
+            SetStatus(KinectState.NotConnected, "nie podłączony");
+            return false;
+        }
+
+        hr = Kinect10.NuiCreateSensorByIndex(0, out var instance);
+        if (hr < 0 || instance == IntPtr.Zero)
+        {
+            SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
+            return false;
+        }
+
+        _sensor = new NuiSensor(instance);
+
+        hr = _sensor.GetStatus();
+        if (hr != 0)
+        {
+            SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
+            return false;
+        }
+
+        hr = _sensor.Initialize(NuiConstants.InitializeUsesColor);
+        if (hr < 0)
+        {
+            SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
+            return false;
+        }
+
+        hr = _sensor.OpenColorStream(out _colorStream);
+        if (hr < 0)
+        {
+            SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
+            return false;
+        }
+
+        if (_sensor.GetElevationAngle(out var angle) >= 0 && _tilt.SetCurrent(angle))
+        {
+            Interlocked.Exchange(ref _tiltReading, angle);
+        }
+
+        SetStatus(KinectState.Running, "działa");
+        return true;
+    }
+
+    private void Pump()
+    {
+        var sensor = _sensor!;
+        var lastFrameTick = Environment.TickCount;
+
+        while (!_stop.WaitOne(0))
+        {
+            var hr = sensor.GetNextFrame(_colorStream, FrameWaitMs, out var frame);
+            if (hr == 0)
+            {
+                lastFrameTick = Environment.TickCount;
+                try
+                {
+                    DeliverFrame(frame.FrameTexture);
+                }
+                finally
+                {
+                    sensor.ReleaseFrame(_colorStream, ref frame);
+                }
+
+                if (_status.State != KinectState.Running)
+                {
+                    SetStatus(KinectState.Running, "działa");
+                }
+            }
+            else if (hr != NuiErrors.FrameNoData && hr != SuccessFalse)
+            {
+                SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
+                return;
+            }
+            else if (unchecked(Environment.TickCount - lastFrameTick) > NoFrameTimeoutMs)
+            {
+                var status = sensor.GetStatus();
+                if (status == 0)
+                {
+                    SetStatus(KinectState.Error, "brak obrazu z kamery – ponowne łączenie");
+                }
+                else
+                {
+                    SetStatus(NuiErrors.StateFor(status), NuiErrors.Describe(status));
+                }
+
+                return;
+            }
+
+            if (_tilt.TryTake(out var angle))
+            {
+                sensor.SetElevationAngle(angle);
+            }
+        }
+    }
+
+    private void DeliverFrame(IntPtr texture)
+    {
+        if (texture == IntPtr.Zero || _texture.LockRect(texture, out var lockedRect) < 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var minimumPitch = NuiConstants.ColorWidth * 4;
+            if (lockedRect.Bits != IntPtr.Zero && lockedRect.Pitch >= minimumPitch && lockedRect.Size >= lockedRect.Pitch * NuiConstants.ColorHeight)
+            {
+                _frameHandler(lockedRect.Bits, lockedRect.Pitch, NuiConstants.ColorWidth, NuiConstants.ColorHeight);
+            }
+        }
+        finally
+        {
+            _texture.UnlockRect(texture);
+        }
+    }
+
+    private void Disconnect()
+    {
+        _colorStream = IntPtr.Zero;
         if (_sensor == null)
         {
             return;
@@ -189,59 +278,18 @@ public sealed class KinectCaptureService : IDisposable
 
         try
         {
-            if (_colorFrameReadyEvent != null && _colorFrameReadyHandler != null)
-            {
-                _colorFrameReadyEvent.RemoveEventHandler(_sensor, _colorFrameReadyHandler);
-            }
-
-            dynamic sensorDynamic = _sensor;
-            sensorDynamic.Stop();
+            _sensor.Dispose();
         }
-        catch
+        catch (Exception exception)
         {
+            SetStatus(KinectState.Error, "błąd zamykania: " + exception.Message);
         }
 
         _sensor = null;
-        _colorFrameReadyEvent = null;
-        _colorFrameReadyHandler = null;
-        SensorChanged?.Invoke(this, null);
     }
 
-    public void Dispose()
+    private void SetStatus(KinectState state, string text)
     {
-        _reconnectTimer.Dispose();
-        if (_statusChangedEvent != null && _statusChangedHandler != null && _sensorCollection != null)
-        {
-            _statusChangedEvent.RemoveEventHandler(_sensorCollection, _statusChangedHandler);
-        }
-
-        lock (_sync)
-        {
-            DisconnectCurrentSensor();
-        }
+        _status = new KinectStatus(state, text);
     }
-}
-
-public sealed class KinectFrameEventArgs : EventArgs
-{
-    public KinectFrameEventArgs(byte[] bgraFrame, int width, int height)
-    {
-        BgraFrame = bgraFrame;
-        Width = width;
-        Height = height;
-    }
-
-    public byte[] BgraFrame { get; }
-    public int Width { get; }
-    public int Height { get; }
-}
-
-public sealed class KinectStatusEventArgs : EventArgs
-{
-    public KinectStatusEventArgs(string text)
-    {
-        Text = text;
-    }
-
-    public string Text { get; }
 }

@@ -1,105 +1,62 @@
-using System.Drawing;
+using System;
+using System.Threading;
+using System.Windows.Forms;
 
 namespace KinectWindowsWebCam;
 
 internal static class Program
 {
+    public const string AppName = "Kinect Windows WebCam";
+    private const string UninstallArgument = "--uninstall";
+    private const string InstanceMutexName = @"Local\KinectWindowsWebCam.Instance";
+
     [STAThread]
-    private static void Main()
+    private static int Main(string[] args)
     {
-        ApplicationConfiguration.Initialize();
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+
+        var command = args.Length > 0 ? args[0].Trim().ToLowerInvariant() : string.Empty;
+        switch (command)
+        {
+            case VirtualCameraInstaller.InstallArgument:
+            case VirtualCameraInstaller.UninstallArgument:
+                return VirtualCameraInstaller.RunElevatedCommand(command);
+            case UninstallArgument:
+                return Uninstall();
+        }
+
+        using var instance = new Mutex(false, InstanceMutexName, out var createdNew);
+        if (!createdNew)
+        {
+            MessageBox.Show("Aplikacja już działa – ikona jest w zasobniku systemowym (obok zegara).", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return 0;
+        }
+
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => ShowError(e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => ShowError(e.ExceptionObject as Exception);
         Application.Run(new TrayApplicationContext());
-    }
-}
-
-internal sealed class TrayApplicationContext : ApplicationContext
-{
-    private const int OutputWidth = 1280;
-    private const int OutputHeight = 960;
-    private const int OutputStride = OutputWidth * 4;
-    private readonly NotifyIcon _notifyIcon;
-    private readonly TrayPopupForm _popup;
-    private readonly KinectCaptureService _captureService;
-    private readonly KinectMotorService _motorService;
-    private readonly VirtualCameraWriter _cameraWriter;
-    private readonly byte[] _outputBuffer = new byte[OutputWidth * OutputHeight * 4];
-    private readonly object _renderLock = new();
-    private volatile int _qualityIndex = 2;
-
-    public TrayApplicationContext()
-    {
-        _popup = new TrayPopupForm();
-        _captureService = new KinectCaptureService();
-        _motorService = new KinectMotorService();
-        _cameraWriter = new VirtualCameraWriter(0);
-
-        _popup.QualityChanged += (_, quality) => _qualityIndex = quality;
-        _popup.TiltChanged += (_, tilt) => _motorService.SetTargetTilt(tilt);
-        _popup.ExitRequested += (_, _) => ExitThread();
-
-        _captureService.FrameReady += OnFrameReady;
-        _captureService.SensorStateChanged += OnSensorStateChanged;
-        _captureService.SensorChanged += (_, sensor) => _motorService.SetSensor(sensor);
-
-        _notifyIcon = new NotifyIcon
-        {
-            Icon = SystemIcons.Application,
-            Visible = true,
-            Text = "Kinect Windows WebCam"
-        };
-        _notifyIcon.MouseClick += (_, _) => TogglePopup();
-
-        _captureService.Start();
+        return 0;
     }
 
-    private void OnSensorStateChanged(object? sender, KinectStatusEventArgs e)
+    private static int Uninstall()
     {
-        if (_popup.IsDisposed)
+        var result = VirtualCameraInstaller.Uninstall();
+        if (result == CameraInstallResult.Success)
         {
-            return;
+            MessageBox.Show("Kamera wirtualna została odinstalowana.", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        else
+        {
+            MessageBox.Show("Odinstalowanie nie powiodło się: " + VirtualCameraInstaller.Describe(result), AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
-        _popup.BeginInvoke(new Action(() => _popup.SetKinectStatus(e.Text)));
+        return (int)result;
     }
 
-    private void OnFrameReady(object? sender, KinectFrameEventArgs e)
+    private static void ShowError(Exception? exception)
     {
-        lock (_renderLock)
-        {
-            var (renderWidth, renderHeight) = QualityPreset.GetRenderSize(_qualityIndex);
-            var qualityBuffer = QualityPreset.GetReusableBuffer(renderWidth, renderHeight);
-            FrameScaler.ScaleBgra(e.BgraFrame, e.Width, e.Height, qualityBuffer, renderWidth, renderHeight);
-            FrameScaler.ScaleBgra(qualityBuffer, renderWidth, renderHeight, _outputBuffer, OutputWidth, OutputHeight);
-            _cameraWriter.SendFrame(OutputWidth, OutputHeight, OutputStride, _outputBuffer);
-        }
-    }
-
-    private void TogglePopup()
-    {
-        if (_popup.Visible)
-        {
-            _popup.Hide();
-            return;
-        }
-
-        var cursor = Cursor.Position;
-        var x = Math.Max(0, cursor.X - _popup.Width + 30);
-        var y = Math.Max(0, cursor.Y - _popup.Height - 10);
-        _popup.Location = new Point(x, y);
-        _popup.Show();
-        _popup.Activate();
-    }
-
-    protected override void ExitThreadCore()
-    {
-        _captureService.FrameReady -= OnFrameReady;
-        _captureService.SensorStateChanged -= OnSensorStateChanged;
-        _captureService.Dispose();
-        _motorService.Dispose();
-        _cameraWriter.Dispose();
-        _popup.Close();
-        _notifyIcon.Visible = false;
-        _notifyIcon.Dispose();
-        base.ExitThreadCore();
+        MessageBox.Show("Nieoczekiwany błąd: " + (exception?.ToString() ?? "nieznany"), AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 }
