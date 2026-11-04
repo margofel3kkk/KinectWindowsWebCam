@@ -1,127 +1,209 @@
-using System.IO.MemoryMappedFiles;
-using System.Runtime.InteropServices;
+using System;
+using System.Threading;
 
 namespace KinectWindowsWebCam;
 
-public sealed class VirtualCameraWriter : IDisposable
+internal sealed unsafe class VirtualCameraWriter : IDisposable
 {
-    private readonly string _mutexName;
-    private readonly string _wantFrameEventName;
-    private readonly string _sentFrameEventName;
-    private readonly string _sharedDataName;
-    private Mutex? _mutex;
-    private EventWaitHandle? _wantFrameEvent;
-    private EventWaitHandle? _sentFrameEvent;
-    private MemoryMappedFile? _mappedFile;
-    private MemoryMappedViewAccessor? _view;
+    public const int DefaultTimeoutMs = 2000;
 
-    public VirtualCameraWriter(int captureDeviceIndex)
+    private const string MutexName = "UnityCapture_Mutx";
+    private const string WantFrameEventName = "UnityCapture_Want";
+    private const string SentFrameEventName = "UnityCapture_Sent";
+    private const string SharedDataName = "UnityCapture_Data";
+    private const int HeaderSize = 32;
+    private const int FormatUInt8 = 0;
+    private const int ResizeModeLinear = 1;
+    private const int MirrorModeDisabled = 0;
+    private const int MirrorModeHorizontal = 1;
+    private const uint MutexWaitMs = 1000;
+    private const int OpenRetryMs = 500;
+    private const int ConsumerActiveMs = 2000;
+
+    private IntPtr _mutex;
+    private IntPtr _wantFrameEvent;
+    private IntPtr _sentFrameEvent;
+    private IntPtr _sharedFile;
+    private byte* _view;
+    private bool _openAttempted;
+    private int _lastOpenAttemptTick;
+    private int _lastRequestTick;
+    private volatile bool _requested;
+
+    public bool IsConsumerActive => _requested && unchecked(Environment.TickCount - Volatile.Read(ref _lastRequestTick)) < ConsumerActiveMs;
+
+    public bool TryBeginFrame()
     {
-        var suffix = captureDeviceIndex == 0 ? string.Empty : captureDeviceIndex.ToString();
-        _mutexName = $"UnityCapture_Mutx{suffix}";
-        _wantFrameEventName = $"UnityCapture_Want{suffix}";
-        _sentFrameEventName = $"UnityCapture_Sent{suffix}";
-        _sharedDataName = $"UnityCapture_Data{suffix}";
-    }
-
-    public bool SendFrame(int width, int height, int stride, byte[] bgraData)
-    {
-        if (bgraData.Length > SharedMemHeader.MaxSharedImageSize)
+        if (!EnsureOpen())
         {
             return false;
         }
 
-        if (!EnsureConnected())
+        var header = (int*)_view;
+        if (header[1] == 0)
+        {
+            return true;
+        }
+
+        if (NativeMethods.WaitForSingleObject(_wantFrameEvent, 0) != NativeMethods.WaitObject0)
         {
             return false;
         }
 
-        if (_view == null || _mutex == null || _sentFrameEvent == null)
-        {
-            return false;
-        }
-
-        var header = new SharedMemHeader
-        {
-            MaxSize = SharedMemHeader.MaxSharedImageSize,
-            Width = width,
-            Height = height,
-            Stride = stride,
-            Format = 0,
-            ResizeMode = 0,
-            MirrorMode = 0,
-            Timeout = 1000
-        };
-
-        _mutex.WaitOne();
-        try
-        {
-            _view.Write(0, ref header);
-            _view.WriteArray(SharedMemHeader.Size, bgraData, 0, bgraData.Length);
-        }
-        finally
-        {
-            _mutex.ReleaseMutex();
-        }
-
-        _sentFrameEvent.Set();
+        Volatile.Write(ref _lastRequestTick, Environment.TickCount);
+        _requested = true;
         return true;
     }
 
-    private bool EnsureConnected()
+    public bool TryOpenNow()
+    {
+        _openAttempted = false;
+        return EnsureOpen();
+    }
+
+    public void Send(int width, int height, uint[] rgbaPixels, bool mirror, int timeoutMs)
+    {
+        if (_view == null)
+        {
+            return;
+        }
+
+        var header = (int*)_view;
+        var dataSize = (long)width * height * 4;
+        if (dataSize > (uint)header[0] || dataSize > (long)rgbaPixels.Length * 4)
+        {
+            return;
+        }
+
+        if (!LockMutex())
+        {
+            return;
+        }
+
+        try
+        {
+            header[1] = width;
+            header[2] = height;
+            header[3] = width;
+            header[4] = FormatUInt8;
+            header[5] = ResizeModeLinear;
+            header[6] = mirror ? MirrorModeHorizontal : MirrorModeDisabled;
+            header[7] = timeoutMs;
+            fixed (uint* source = rgbaPixels)
+            {
+                Buffer.MemoryCopy(source, _view + HeaderSize, dataSize, dataSize);
+            }
+        }
+        finally
+        {
+            NativeMethods.ReleaseMutex(_mutex);
+        }
+
+        NativeMethods.SetEvent(_sentFrameEvent);
+    }
+
+    public void Dispose()
+    {
+        if (_view != null)
+        {
+            NativeMethods.UnmapViewOfFile((IntPtr)_view);
+            _view = null;
+        }
+
+        Close(ref _sharedFile);
+        Close(ref _sentFrameEvent);
+        Close(ref _wantFrameEvent);
+        Close(ref _mutex);
+    }
+
+    private bool EnsureOpen()
     {
         if (_view != null)
         {
             return true;
         }
 
-        try
+        var now = Environment.TickCount;
+        if (_openAttempted && unchecked(now - _lastOpenAttemptTick) < OpenRetryMs)
         {
-            _mutex = Mutex.OpenExisting(_mutexName);
-            _wantFrameEvent = EventWaitHandle.OpenExisting(_wantFrameEventName);
-            _sentFrameEvent = EventWaitHandle.OpenExisting(_sentFrameEventName);
-            _mappedFile = MemoryMappedFile.OpenExisting(_sharedDataName, MemoryMappedFileRights.ReadWrite);
-            _view = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
-            return true;
-        }
-        catch
-        {
-            DisposeHandles();
             return false;
         }
+
+        _openAttempted = true;
+        _lastOpenAttemptTick = now;
+
+        if (_mutex == IntPtr.Zero)
+        {
+            _mutex = NativeMethods.OpenMutex(NativeMethods.Synchronize, false, MutexName);
+            if (_mutex == IntPtr.Zero)
+            {
+                return false;
+            }
+        }
+
+        if (!LockMutex())
+        {
+            return false;
+        }
+
+        try
+        {
+            if (_wantFrameEvent == IntPtr.Zero)
+            {
+                _wantFrameEvent = NativeMethods.CreateEvent(IntPtr.Zero, false, false, WantFrameEventName);
+                if (_wantFrameEvent == IntPtr.Zero)
+                {
+                    return false;
+                }
+            }
+
+            if (_sentFrameEvent == IntPtr.Zero)
+            {
+                _sentFrameEvent = NativeMethods.OpenEvent(NativeMethods.EventModifyState, false, SentFrameEventName);
+                if (_sentFrameEvent == IntPtr.Zero)
+                {
+                    return false;
+                }
+            }
+
+            if (_sharedFile == IntPtr.Zero)
+            {
+                _sharedFile = NativeMethods.OpenFileMapping(NativeMethods.FileMapWrite, false, SharedDataName);
+                if (_sharedFile == IntPtr.Zero)
+                {
+                    return false;
+                }
+            }
+
+            var view = NativeMethods.MapViewOfFile(_sharedFile, NativeMethods.FileMapWrite, 0, 0, UIntPtr.Zero);
+            if (view == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            _view = (byte*)view;
+            return true;
+        }
+        finally
+        {
+            NativeMethods.ReleaseMutex(_mutex);
+        }
     }
 
-    private void DisposeHandles()
+    private bool LockMutex()
     {
-        _view?.Dispose();
-        _mappedFile?.Dispose();
-        _wantFrameEvent?.Dispose();
-        _sentFrameEvent?.Dispose();
-        _mutex?.Dispose();
-        _view = null;
-        _mappedFile = null;
-        _wantFrameEvent = null;
-        _sentFrameEvent = null;
-        _mutex = null;
+        var result = NativeMethods.WaitForSingleObject(_mutex, MutexWaitMs);
+        return result == NativeMethods.WaitObject0 || result == NativeMethods.WaitAbandoned;
     }
 
-    public void Dispose()
+    private static void Close(ref IntPtr handle)
     {
-        DisposeHandles();
-    }
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct SharedMemHeader
-    {
-        public const int MaxSharedImageSize = 3840 * 2160 * 4 * sizeof(short);
-        public const int Size = 32;
-        public int MaxSize;
-        public int Width;
-        public int Height;
-        public int Stride;
-        public int Format;
-        public int ResizeMode;
-        public int MirrorMode;
-        public int Timeout;
+        NativeMethods.CloseHandle(handle);
+        handle = IntPtr.Zero;
     }
 }
