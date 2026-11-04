@@ -12,30 +12,60 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private const int PopupReopenGuardMs = 300;
     private const int NotifyIconTextLimit = 63;
     private const int BalloonTimeoutMs = 8000;
+    private const int SaveDelayMs = 1000;
 
+    private readonly AppSettings _settings;
     private readonly TrayPopupForm _popup;
     private readonly NotifyIcon _notifyIcon;
     private readonly Timer _statusTimer;
+    private readonly Timer _saveTimer;
     private readonly TiltScheduler _tilt = new();
-    private readonly FrameConverter _converter = new();
-    private readonly VirtualCameraWriter _writer = new();
+    private readonly CameraOutput _output;
     private readonly KinectCaptureService _capture;
-    private volatile int _quality = FrameConverter.DefaultQuality;
-    private volatile bool _widescreen = true;
-    private volatile bool _mirror;
     private bool _cameraInstalled;
     private bool _installing;
     private string _cameraProblem = "nie zainstalowana";
     private bool _driverBalloonShown;
+    private bool _saveWarningShown;
     private bool _exited;
 
     public TrayApplicationContext()
     {
-        _popup = new TrayPopupForm(_quality, _widescreen, _mirror);
-        _popup.QualityChanged += (_, value) => _quality = value;
-        _popup.TiltChanged += (_, value) => _tilt.SetTarget(value);
-        _popup.WidescreenChanged += (_, value) => _widescreen = value;
-        _popup.MirrorChanged += (_, value) => _mirror = value;
+        _settings = AppSettings.Load();
+        _output = new CameraOutput(_settings.Quality, _settings.Widescreen, _settings.Mirror);
+        if (_settings.Tilt.HasValue)
+        {
+            _tilt.SetTarget(_settings.Tilt.Value);
+        }
+
+        Autostart.UpdatePathIfEnabled();
+
+        _popup = new TrayPopupForm(_settings.Quality, _settings.Widescreen, _settings.Mirror, _settings.Tilt ?? 0, Autostart.IsEnabled());
+        _popup.QualityChanged += (_, value) =>
+        {
+            _output.Quality = value;
+            _settings.Quality = value;
+            ScheduleSave();
+        };
+        _popup.TiltChanged += (_, value) =>
+        {
+            _tilt.SetTarget(value);
+            _settings.Tilt = value;
+            ScheduleSave();
+        };
+        _popup.WidescreenChanged += (_, value) =>
+        {
+            _output.Widescreen = value;
+            _settings.Widescreen = value;
+            ScheduleSave();
+        };
+        _popup.MirrorChanged += (_, value) =>
+        {
+            _output.Mirror = value;
+            _settings.Mirror = value;
+            ScheduleSave();
+        };
+        _popup.AutostartChanged += (_, value) => ChangeAutostart(value);
         _popup.InstallCameraRequested += (_, _) => InstallCamera();
         _popup.DownloadSdkRequested += (_, _) => OpenSdkDownload();
         _popup.ExitRequested += (_, _) => ExitThread();
@@ -48,7 +78,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         };
         _notifyIcon.MouseClick += (_, _) => TogglePopup();
 
-        _capture = new KinectCaptureService(_tilt, OnKinectFrame);
+        _saveTimer = new Timer { Interval = SaveDelayMs };
+        _saveTimer.Tick += (_, _) => SaveSettings();
+
+        _capture = new KinectCaptureService(_tilt, _output);
         _capture.Start();
 
         _statusTimer = new Timer { Interval = 500 };
@@ -69,11 +102,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (!_exited)
         {
             _exited = true;
+            if (_saveTimer.Enabled)
+            {
+                SaveSettings();
+            }
+
+            _saveTimer.Dispose();
             _statusTimer.Stop();
             _statusTimer.Dispose();
             if (_capture.Stop(TimeSpan.FromSeconds(3)))
             {
-                _writer.Dispose();
+                _output.Dispose();
             }
 
             _notifyIcon.Visible = false;
@@ -84,15 +123,32 @@ internal sealed class TrayApplicationContext : ApplicationContext
         base.ExitThreadCore();
     }
 
-    private void OnKinectFrame(IntPtr bgrxPixels, int pitch, int width, int height)
+    private void ScheduleSave()
     {
-        if (!_writer.TryBeginFrame())
+        _saveTimer.Stop();
+        _saveTimer.Start();
+    }
+
+    private void SaveSettings()
+    {
+        _saveTimer.Stop();
+        if (_settings.Save() || _saveWarningShown || _exited)
         {
             return;
         }
 
-        _converter.Convert(bgrxPixels, pitch, width, height, _quality, _widescreen);
-        _writer.Send(_converter.Width, _converter.Height, _converter.Pixels, _mirror);
+        _saveWarningShown = true;
+        ShowBalloon("Nie udało się zapisać ustawień w " + AppSettings.DirectoryPath + ".", ToolTipIcon.Warning);
+    }
+
+    private void ChangeAutostart(bool enabled)
+    {
+        var changed = Autostart.SetEnabled(enabled);
+        _popup.SetAutostart(Autostart.IsEnabled());
+        if (!changed)
+        {
+            ShowBalloon("Nie udało się zmienić autostartu (brak dostępu do rejestru).", ToolTipIcon.Warning);
+        }
     }
 
     private async void InstallCamera()
@@ -140,6 +196,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         string camera;
+        var outputError = _output.LastError;
         if (_installing)
         {
             camera = "instalowanie…";
@@ -148,9 +205,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             camera = _cameraProblem;
         }
+        else if (outputError != null)
+        {
+            camera = "błąd: " + outputError;
+        }
         else
         {
-            camera = _writer.IsConsumerActive ? "nadaje" : $"gotowa – wybierz „{VirtualCameraInstaller.DeviceName}”";
+            camera = _output.IsConsumerActive ? "nadaje" : $"gotowa – wybierz „{VirtualCameraInstaller.DeviceName}”";
         }
 
         _popup.SetCameraStatus(camera, !_cameraInstalled && !_installing);
@@ -178,6 +239,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         RefreshStatus();
+        _popup.SetAutostart(Autostart.IsEnabled());
         _popup.PerformLayout();
 
         var cursor = Cursor.Position;

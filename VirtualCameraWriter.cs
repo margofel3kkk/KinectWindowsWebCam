@@ -5,6 +5,8 @@ namespace KinectWindowsWebCam;
 
 internal sealed unsafe class VirtualCameraWriter : IDisposable
 {
+    public const int DefaultTimeoutMs = 2000;
+
     private const string MutexName = "UnityCapture_Mutx";
     private const string WantFrameEventName = "UnityCapture_Want";
     private const string SentFrameEventName = "UnityCapture_Sent";
@@ -14,7 +16,6 @@ internal sealed unsafe class VirtualCameraWriter : IDisposable
     private const int ResizeModeLinear = 1;
     private const int MirrorModeDisabled = 0;
     private const int MirrorModeHorizontal = 1;
-    private const int ReceiverTimeoutMs = 2000;
     private const uint MutexWaitMs = 1000;
     private const int OpenRetryMs = 500;
     private const int ConsumerActiveMs = 2000;
@@ -54,7 +55,13 @@ internal sealed unsafe class VirtualCameraWriter : IDisposable
         return true;
     }
 
-    public void Send(int width, int height, uint[] rgbaPixels, bool mirror)
+    public bool TryOpenNow()
+    {
+        _openAttempted = false;
+        return EnsureOpen();
+    }
+
+    public void Send(int width, int height, uint[] rgbaPixels, bool mirror, int timeoutMs)
     {
         if (_view == null)
         {
@@ -81,7 +88,7 @@ internal sealed unsafe class VirtualCameraWriter : IDisposable
             header[4] = FormatUInt8;
             header[5] = ResizeModeLinear;
             header[6] = mirror ? MirrorModeHorizontal : MirrorModeDisabled;
-            header[7] = ReceiverTimeoutMs;
+            header[7] = timeoutMs;
             fixed (uint* source = rgbaPixels)
             {
                 Buffer.MemoryCopy(source, _view + HeaderSize, dataSize, dataSize);

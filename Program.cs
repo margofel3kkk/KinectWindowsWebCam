@@ -42,10 +42,19 @@ internal static class Program
 
     private static int Uninstall()
     {
+        if (Mutex.TryOpenExisting(InstanceMutexName, out var runningInstance))
+        {
+            runningInstance.Dispose();
+            MessageBox.Show("Najpierw zamknij działającą aplikację (ikona w zasobniku → Zamknij aplikację).", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return (int)CameraInstallResult.Failed;
+        }
+
         var result = VirtualCameraInstaller.Uninstall();
         if (result == CameraInstallResult.Success)
         {
-            MessageBox.Show("Kamera wirtualna została odinstalowana.", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Autostart.SetEnabled(false);
+            AppSettings.Delete();
+            MessageBox.Show("Kamera wirtualna, autostart i ustawienia zostały usunięte.", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         else
         {

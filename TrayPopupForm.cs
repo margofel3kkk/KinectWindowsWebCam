@@ -19,13 +19,15 @@ internal sealed class TrayPopupForm : Form
     private readonly TrackBar _tiltTrackBar;
     private readonly CheckBox _widescreenCheckBox;
     private readonly CheckBox _mirrorCheckBox;
+    private readonly CheckBox _autostartCheckBox;
     private readonly Label _kinectStatusLabel;
     private readonly Button _downloadSdkButton;
     private readonly Label _cameraStatusLabel;
     private readonly Button _installCameraButton;
     private bool _updatingTilt;
+    private bool _updatingAutostart;
 
-    public TrayPopupForm(int quality, bool widescreen, bool mirror)
+    public TrayPopupForm(int quality, bool widescreen, bool mirror, int tilt, bool autostart)
     {
         SuspendLayout();
         FormBorderStyle = FormBorderStyle.None;
@@ -41,9 +43,10 @@ internal sealed class TrayPopupForm : Form
         _qualityLabel = CreateLabel(Color.White);
         _qualityTrackBar = CreateTrackBar(0, FrameConverter.QualityLevels - 1, 1, quality);
         _tiltLabel = CreateLabel(Color.White);
-        _tiltTrackBar = CreateTrackBar(NuiConstants.ElevationMinimum, NuiConstants.ElevationMaximum, 3, 0);
+        _tiltTrackBar = CreateTrackBar(NuiConstants.ElevationMinimum, NuiConstants.ElevationMaximum, 3, tilt);
         _widescreenCheckBox = CreateCheckBox("Kadr 16:9 (przycięty z 4:3)", widescreen);
         _mirrorCheckBox = CreateCheckBox("Odbicie lustrzane", mirror);
+        _autostartCheckBox = CreateCheckBox("Uruchamiaj razem z Windows", autostart);
         _kinectStatusLabel = CreateLabel(StatusTextColor);
         _downloadSdkButton = CreateButton("Pobierz Kinect for Windows SDK 1.8");
         _cameraStatusLabel = CreateLabel(StatusTextColor);
@@ -71,6 +74,7 @@ internal sealed class TrayPopupForm : Form
             _tiltTrackBar,
             _widescreenCheckBox,
             _mirrorCheckBox,
+            _autostartCheckBox,
             _kinectStatusLabel,
             _downloadSdkButton,
             _cameraStatusLabel,
@@ -103,6 +107,13 @@ internal sealed class TrayPopupForm : Form
             WidescreenChanged?.Invoke(this, _widescreenCheckBox.Checked);
         };
         _mirrorCheckBox.CheckedChanged += (_, _) => MirrorChanged?.Invoke(this, _mirrorCheckBox.Checked);
+        _autostartCheckBox.CheckedChanged += (_, _) =>
+        {
+            if (!_updatingAutostart)
+            {
+                AutostartChanged?.Invoke(this, _autostartCheckBox.Checked);
+            }
+        };
         _downloadSdkButton.Click += (_, _) => DownloadSdkRequested?.Invoke(this, EventArgs.Empty);
         _installCameraButton.Click += (_, _) => InstallCameraRequested?.Invoke(this, EventArgs.Empty);
         exitButton.Click += (_, _) => ExitRequested?.Invoke(this, EventArgs.Empty);
@@ -114,6 +125,7 @@ internal sealed class TrayPopupForm : Form
     public event EventHandler<int>? TiltChanged;
     public event EventHandler<bool>? WidescreenChanged;
     public event EventHandler<bool>? MirrorChanged;
+    public event EventHandler<bool>? AutostartChanged;
     public event EventHandler? InstallCameraRequested;
     public event EventHandler? DownloadSdkRequested;
     public event EventHandler? ExitRequested;
@@ -158,6 +170,24 @@ internal sealed class TrayPopupForm : Form
         finally
         {
             _updatingTilt = false;
+        }
+    }
+
+    public void SetAutostart(bool enabled)
+    {
+        if (_autostartCheckBox.Checked == enabled)
+        {
+            return;
+        }
+
+        _updatingAutostart = true;
+        try
+        {
+            _autostartCheckBox.Checked = enabled;
+        }
+        finally
+        {
+            _updatingAutostart = false;
         }
     }
 

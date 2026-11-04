@@ -24,18 +24,19 @@ internal sealed class KinectStatus
     public string Text { get; }
 }
 
-internal delegate void KinectFrameHandler(IntPtr bgrxPixels, int pitch, int width, int height);
-
 internal sealed class KinectCaptureService : IDisposable
 {
     private const int RetryDelayMs = 2000;
+    private const int IdleTickMs = 250;
     private const uint FrameWaitMs = 100;
+    private const int NoSignalPlaceholderMs = 1500;
     private const int NoFrameTimeoutMs = 3000;
     private const int NoTiltReading = int.MinValue;
     private const int SuccessFalse = 1;
+    private const string NoPictureMessage = "Kinect: brak obrazu";
 
     private readonly TiltScheduler _tilt;
-    private readonly KinectFrameHandler _frameHandler;
+    private readonly IKinectFrameSink _sink;
     private readonly NuiFrameTextureAccessor _texture = new();
     private readonly ManualResetEvent _stop = new(false);
     private readonly Thread _thread;
@@ -44,10 +45,10 @@ internal sealed class KinectCaptureService : IDisposable
     private NuiSensor? _sensor;
     private IntPtr _colorStream;
 
-    public KinectCaptureService(TiltScheduler tilt, KinectFrameHandler frameHandler)
+    public KinectCaptureService(TiltScheduler tilt, IKinectFrameSink sink)
     {
         _tilt = tilt;
-        _frameHandler = frameHandler;
+        _sink = sink;
         _thread = new Thread(Run)
         {
             IsBackground = true,
@@ -105,11 +106,13 @@ internal sealed class KinectCaptureService : IDisposable
                     Disconnect();
                 }
 
-                if (_stop.WaitOne(RetryDelayMs))
+                if (WaitShowingStatus(RetryDelayMs))
                 {
                     break;
                 }
             }
+
+            _sink.OnShutdown();
         }
         finally
         {
@@ -225,19 +228,28 @@ internal sealed class KinectCaptureService : IDisposable
                 SetStatus(NuiErrors.StateFor(hr), NuiErrors.Describe(hr));
                 return;
             }
-            else if (unchecked(Environment.TickCount - lastFrameTick) > NoFrameTimeoutMs)
+            else
             {
-                var status = sensor.GetStatus();
-                if (status == 0)
+                var silentMs = unchecked(Environment.TickCount - lastFrameTick);
+                if (silentMs > NoFrameTimeoutMs)
                 {
-                    SetStatus(KinectState.Error, "brak obrazu z kamery – ponowne łączenie");
-                }
-                else
-                {
-                    SetStatus(NuiErrors.StateFor(status), NuiErrors.Describe(status));
+                    var status = sensor.GetStatus();
+                    if (status == 0)
+                    {
+                        SetStatus(KinectState.Error, "brak obrazu z kamery – ponowne łączenie");
+                    }
+                    else
+                    {
+                        SetStatus(NuiErrors.StateFor(status), NuiErrors.Describe(status));
+                    }
+
+                    return;
                 }
 
-                return;
+                if (silentMs > NoSignalPlaceholderMs)
+                {
+                    _sink.OnNoSignal(NoPictureMessage);
+                }
             }
 
             if (_tilt.TryTake(out var angle))
@@ -259,13 +271,34 @@ internal sealed class KinectCaptureService : IDisposable
             var minimumPitch = NuiConstants.ColorWidth * 4;
             if (lockedRect.Bits != IntPtr.Zero && lockedRect.Pitch >= minimumPitch && lockedRect.Size >= lockedRect.Pitch * NuiConstants.ColorHeight)
             {
-                _frameHandler(lockedRect.Bits, lockedRect.Pitch, NuiConstants.ColorWidth, NuiConstants.ColorHeight);
+                _sink.OnFrame(lockedRect.Bits, lockedRect.Pitch, NuiConstants.ColorWidth, NuiConstants.ColorHeight);
             }
         }
         finally
         {
             _texture.UnlockRect(texture);
         }
+    }
+
+    private bool WaitShowingStatus(int durationMs)
+    {
+        var start = Environment.TickCount;
+        while (!_stop.WaitOne(0))
+        {
+            _sink.OnNoSignal("Kinect: " + _status.Text);
+            var remainingMs = durationMs - unchecked(Environment.TickCount - start);
+            if (remainingMs <= 0)
+            {
+                return _stop.WaitOne(0);
+            }
+
+            if (_stop.WaitOne(Math.Min(remainingMs, IdleTickMs)))
+            {
+                return true;
+            }
+        }
+
+        return true;
     }
 
     private void Disconnect()

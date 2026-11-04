@@ -33,7 +33,22 @@ Kinect wymaga zasilacza z adapterem USB — sam kabel z konsoli nie zadziała na
 - **Kadr 16:9** — przycina obraz 4:3 do 16:9, żeby nie był rozciągnięty w aplikacjach,
   które proszą o 1280×720 (Discord, Meet, Teams, Zoom). Wyłącz dla aplikacji 4:3.
 - **Odbicie lustrzane** — odwraca obraz w poziomie.
+- **Uruchamiaj razem z Windows** — wpis w `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  wskazujący na aktualne położenie pliku `.exe`. Jeśli przeniesiesz plik, uruchom go raz
+  z nowego miejsca — ścieżka poprawi się sama. Wyłączenie autostartu w Menedżerze zadań
+  jest respektowane i widoczne w tym polu.
 - Status Kinecta i kamery wirtualnej oraz przycisk zamknięcia aplikacji.
+
+Ustawienia (jakość, kadr, odbicie, nachylenie) zapisują się automatycznie w
+`%APPDATA%\KinectWindowsWebCam\settings.ini` i są przywracane przy starcie, łącznie
+z ustawieniem silnika Kinecta.
+
+## Co widać w aplikacji, gdy Kinect nie daje obrazu
+
+Zamiast wzoru testowego UnityCapture aplikacja wysyła planszę „Kinect WebCam” z aktualnym
+statusem (np. „nie podłączony”, „brak sterownika”), a po zamknięciu aplikacji — planszę
+„Aplikacja jest zamknięta”, która zostaje w Discordzie/OBS, dopóki kamera jest w nich
+otwarta.
 
 ## Odinstalowanie
 
@@ -41,7 +56,8 @@ Kinect wymaga zasilacza z adapterem USB — sam kabel z konsoli nie zadziała na
 KinectWindowsWebCam.exe --uninstall
 ```
 
-Wyrejestrowuje filtr kamery i usuwa `%ProgramFiles%\KinectWindowsWebCam`.
+Wymaga zamkniętej aplikacji. Wyrejestrowuje filtr kamery, usuwa
+`%ProgramFiles%\KinectWindowsWebCam`, wpis autostartu i katalog z ustawieniami.
 
 ## Budowanie
 
@@ -63,6 +79,9 @@ tworzy GitHub Release z plikiem `.exe`, ręczne uruchomienie workflow daje go ja
   wymagana przez filtr.
 - `VirtualCameraWriter.cs` — wysyłanie klatek do filtra UnityCapture przez pamięć
   współdzieloną; klatka jest liczona tylko, gdy jakaś aplikacja faktycznie używa kamery.
+- `CameraOutput.cs`, `PlaceholderRenderer.cs` — wybór między obrazem z Kinecta a planszą
+  statusu.
+- `AppSettings.cs`, `Autostart.cs` — zapis ustawień i autostart.
 - `VirtualCameraInstaller.cs` — wypakowanie i rejestracja filtra (x64 i x86) z jednorazowym
   podniesieniem uprawnień.
 - `TrayApplicationContext.cs`, `TrayPopupForm.cs` — ikona w zasobniku i okno ustawień.
